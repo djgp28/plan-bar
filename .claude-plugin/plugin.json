@@ -1,6 +1,6 @@
 {
   "name": "plan-bar",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A purple progress bar above the prompt: the plan step in progress, steps done out of total, a time estimate and the tokens used. Hover or click it for every step with its time and tokens.",
   "author": { "name": "djgp28", "url": "https://github.com/djgp28" },
   "homepage": "https://github.com/djgp28/plan-bar",

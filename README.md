@@ -4,7 +4,7 @@
 
 **A plan progress bar for Claude Code — live step tracking, ETA and per-step token accounting, rendered above the prompt.**
 
-[![Version](https://img.shields.io/badge/version-0.2.0-8b5cf6?style=flat-square)](.claude-plugin/plugin.json)
+[![Version](https://img.shields.io/badge/version-0.3.0-8b5cf6?style=flat-square)](.claude-plugin/plugin.json)
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-%E2%89%A5%202.1.287-6d28d9?style=flat-square)](https://docs.anthropic.com/en/docs/claude-code)
 [![License: MIT](https://img.shields.io/badge/license-MIT-c4b5fd?style=flat-square)](LICENSE)
 
@@ -27,7 +27,7 @@
 
 Hover or click the bar to expand a breakdown: per-step duration and token usage, the per-step average, and the token total split into cache reads, uncached input and output. Click again to collapse.
 
-When every step is complete the bar holds at 100% for 20 seconds, then clears. The mod renders nothing else — no side panes, no subagent cards.
+Each time a step finishes, a toast notification names it (`Done: <step>`). When every step is complete, a final toast reports it (`All N steps done.`) and the bar holds at 100% for 20 seconds, then clears. The mod renders nothing else — no side panes, no subagent cards.
 
 ## Installation
 

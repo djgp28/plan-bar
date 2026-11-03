@@ -15,9 +15,12 @@ const BAND = {
 } as const
 
 const MIN = 60_000
+/** Toasts the mod raised in the current test. */
+const toasts: string[] = []
 
 /** The engine beneath the plugin: only the files the test names, a placeholder band. */
 function engine(on: On, registered: string[] = [], files: Record<string, string> = {}) {
+  toasts.length = 0
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: 'sid-1' }))
   on('tool.register', (_, e) => {
@@ -30,6 +33,10 @@ function engine(on: On, registered: string[] = [], files: Record<string, string>
   on('fs.write', () => ({ value: undefined }))
   on('process.run', () => ({ value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('ui.toast', (_, e) => {
+    toasts.push((e as { text: string }).text)
+    return { value: undefined }
+  })
   on('ui.render', ($, e) => {
     const { Text } = $.ui.resolve(e)
     return <Text>engine band</Text>
@@ -247,4 +254,29 @@ test('tokens stop counting once the plan is finished', async ($, on) => {
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: /tok/ })).toBeUndefined()
   await ui.unmount()
+})
+
+test('a finished step and a finished plan each raise a toast', async ($, on) => {
+  const clock = engine(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await plan($, { title: 'Ship it', steps: S('c', 'i', 'p') })
+  await clock.settle()
+  expect(toasts).toEqual([])
+
+  await plan($, { title: 'Ship it', steps: S('c', 'i', 'p') })
+  await clock.settle()
+  expect(toasts).toEqual([])
+
+  await plan($, { title: 'Ship it', steps: S('c', 'c', 'i') })
+  await clock.settle()
+  expect(toasts).toEqual(['Done: Step 2'])
+
+  await plan($, { title: 'Ship it', steps: S('c', 'c', 'c') })
+  await clock.settle()
+  expect(toasts).toEqual(['Done: Step 2', 'All 3 steps done.'])
+
+  // Sending the finished plan again says nothing new.
+  await plan($, { title: 'Ship it', steps: S('c', 'c', 'c') })
+  await clock.settle()
+  expect(toasts).toHaveLength(2)
 })

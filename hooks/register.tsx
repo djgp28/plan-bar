@@ -123,10 +123,15 @@ function parseTodos(args: Record<string, unknown>): StepIn[] {
  * The new list laid over the old one: a step keeps its times while its text stays the
  * same. A list with work left in it after a finished plan starts a new plan.
  */
+/** A list with work left in it after a finished plan (or with no plan before) starts a new plan. */
+function isFresh(old: BarPlan | null, incoming: readonly StepIn[]) {
+  return !old || !old.steps.length || (allDone(old.steps) && !allDone(incoming))
+}
+
 function merge(old: BarPlan | null, title: string | undefined, incoming: readonly StepIn[], now: number): BarPlan {
   const nowDone = allDone(incoming)
   const wasDone = !!old && allDone(old.steps)
-  const fresh = !old || !old.steps.length || (wasDone && !nowDone)
+  const fresh = isFresh(old, incoming)
   // Old steps by text, oldest first, so two steps with the same text pair up in order.
   const byText = new Map<string, BarStep[]>()
   if (!fresh && old) for (const o of old.steps) byText.set(o.text, [...(byText.get(o.text) ?? []), o])
@@ -374,9 +379,43 @@ function scheduleHide($: EngineInterface) {
   })
 }
 
+/** What a plan update should announce: the steps that just finished, or the whole plan. */
+function notice(old: BarPlan | null, incoming: readonly StepIn[]): string | null {
+  if (!incoming.length) return null
+  if (allDone(incoming)) {
+    if (old && old.steps.length && allDone(old.steps)) return null
+    return incoming.length === 1 ? 'All steps done.' : `All ${incoming.length} steps done.`
+  }
+  // Steps already done when a plan first arrives are not news.
+  if (isFresh(old, incoming)) return null
+  const before = new Map<string, number>()
+  for (const o of old!.steps) if (o.status === 'completed') before.set(o.text, (before.get(o.text) ?? 0) + 1)
+  const done: string[] = []
+  for (const st of incoming) {
+    if (st.status !== 'completed') continue
+    const n = before.get(st.text) ?? 0
+    if (n > 0) before.set(st.text, n - 1)
+    else done.push(st.text)
+  }
+  return done.length ? `Done: ${done.join(', ')}` : null
+}
+
+function toast($: EngineInterface, text: string) {
+  try {
+    $.ui.toast(cut(text, 140))
+  } catch {
+    // A toast is only a hint.
+  }
+}
+
 async function applyPlan($: EngineInterface, title: string | undefined, incoming: readonly StepIn[]) {
   const now = await $.clock.now()
-  const p = await update($, planAtom, old => merge(old, title, incoming, now))
+  let said: string | null = null
+  const p = await update($, planAtom, old => {
+    said = notice(old, incoming)
+    return merge(old, title, incoming, now)
+  })
+  if (said) toast($, said)
   if (p && allDone(p.steps) && p.shown) scheduleHide($)
   else {
     holdTimer?.cancel()
