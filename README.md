@@ -1,60 +1,101 @@
+<div align="center">
+
 # plan-bar
 
-A Claude Code mod that puts one purple progress bar above the prompt while Claude works through a plan:
+**A plan progress bar for Claude Code — live step tracking, ETA and per-step token accounting, rendered above the prompt.**
 
-```
+[![Version](https://img.shields.io/badge/version-0.1.0-8b5cf6?style=flat-square)](.claude-plugin/plugin.json)
+[![Claude Code](https://img.shields.io/badge/Claude%20Code-%E2%89%A5%202.1.287-6d28d9?style=flat-square)](https://docs.anthropic.com/en/docs/claude-code)
+[![License: MIT](https://img.shields.io/badge/license-MIT-c4b5fd?style=flat-square)](LICENSE)
+
+</div>
+
+```text
 ◐ Write the parser        ████████▓▓▓░░░░░░░░░░  2/5 · ~4m left · 1.24M tok ▴
 ```
 
-- **The step in progress**, by name
-- **Steps done out of total**, with a purple bar that fills as steps finish
-- **Time left**: the average time per finished step × the steps still to do
-- **Tokens used** by the plan so far
+## Overview
 
-Hover over the bar, or click it, to see every step with how long it took and how many tokens it used, the average per step, and the token total split into cache reads, new input and output. Click again to close. Nothing else is drawn: no side pane, no subagent cards.
+`plan-bar` is a Claude Code mod that turns the model's plan into a single-line status bar. While Claude works through a multi-step task, the bar shows:
 
-Once every step is done, the bar stays at 100% for 20 seconds and then goes away.
+| Field | Description |
+| --- | --- |
+| **Current step** | Label of the step currently `in_progress`. |
+| **Progress** | Completed steps over total, with a bar that fills as steps finish. |
+| **ETA** | Mean duration of finished steps × remaining steps. |
+| **Tokens** | Total tokens consumed by the plan so far. |
 
-## Install
+Hover or click the bar to expand a breakdown: per-step duration and token usage, the per-step average, and the token total split into cache reads, uncached input and output. Click again to collapse.
 
-At the prompt of a Claude Code terminal session:
+When every step is complete the bar holds at 100% for 20 seconds, then clears. The mod renders nothing else — no side panes, no subagent cards.
 
-```
+## Installation
+
+**Requirements:** Claude Code `2.1.287+` (terminal) or `2.1.286+` (desktop Code tab). Check with `claude --version`.
+
+**Terminal (inside a session):**
+
+```text
 /plugin install plan-bar --marketplace djgp28/plan-bar
 ```
 
-Answer `y` to add the marketplace, then pick the user scope so it loads in every chat.
+Confirm adding the marketplace and choose **user** scope so the mod loads in every session.
 
-From a shell:
+**Shell:**
 
-```
+```bash
 claude plugin install plan-bar --marketplace djgp28/plan-bar
 ```
 
-In the desktop app, where `/plugin` does not run: click **+** next to the prompt box, then **Plugins**, **Add marketplace** with `djgp28/plan-bar`, then **Add plugin**.
+**Desktop app** (`/plugin` is unavailable): **+** next to the prompt box → **Plugins** → **Add marketplace** → `djgp28/plan-bar` → **Add plugin**.
 
-Chats that were already open before the install load it after `/reload-plugins`. It needs Claude Code 2.1.287 or newer (2.1.286 in the desktop Code tab).
+Sessions opened before the install pick it up after `/reload-plugins`.
 
-## Where the plan comes from
+## Plan sources
 
-plan-bar reads the plan from Claude's own calls:
+`plan-bar` reads plan state from the model's own tool calls in the transcript, so mod load order does not matter. Supported sources:
 
-- `mcp__helper-desk__plan`, from the [helper-desk](https://www.benai.co) mod, when that mod is installed
-- `TodoWrite`
+1. `mcp__helper-desk__plan` — provided by the **helper-desk** mod from [Ben AI's Claude Code mods](https://www.benai.co), when installed and enabled.
+2. `TodoWrite` — Claude Code's built-in to-do tool.
+3. `mcp__plan-bar__plan` — a fallback tool `plan-bar` registers itself when helper-desk is absent or disabled. Same schema:
 
-Where helper-desk is not installed or is switched off, plan-bar adds its own `mcp__plan-bar__plan` tool (same input: an optional `title` and `steps` of `{ text, status }`) and asks Claude to use it for any task with two or more steps.
+   ```ts
+   { title?: string; steps: { text: string; status: 'pending' | 'in_progress' | 'completed' }[] }
+   ```
 
-If you use helper-desk too, hide its pane and bar in `/mods` (Helper Desk → **Hidden**) and leave it **On**, so its plan tool keeps feeding plan-bar.
+   When the fallback is active, `plan-bar` also instructs the model to call it for any task with two or more steps.
 
-## How the numbers are counted
+> [!TIP]
+> Running helper-desk alongside `plan-bar`? In `/mods`, set **Helper Desk → Hidden** but keep it **On**. Its UI disappears while its plan tool keeps feeding `plan-bar`.
 
-- **Time**: each finished step runs from the finish before it (or the plan's start). Steps already done when the plan first arrives are left out of the average. The estimate shows once one step has finished.
-- **Tokens**: every model request made while a step is in progress counts toward that step, its subagents' requests included. Requests while no step is in progress count as "between steps". Totals include prompt-cache reads, which are usually most of them; the details line splits them out.
+## Metrics
 
-## Off switch and logs
+**Duration.** A step's duration runs from the previous step's completion (or the plan's start) to its own completion. Steps already marked complete when the plan is first received are excluded from the average. The ETA appears once at least one step has been timed.
 
-Turn it off in every chat from the `/mods` pane, or with `"plan-bar": false` in `~/.claude/mods/switches.json`. Errors go to `~/.claude/mods-logs/plan-bar.log`. The plan of each chat is kept in `~/.claude/mods-state/plan-bar-<session id>.json` so a resumed chat picks it up again.
+**Tokens.** Every model request issued while a step is `in_progress` is attributed to that step, including requests from subagents. Requests made while no step is in progress are reported as *between steps*. Totals include prompt-cache reads — usually the bulk of the count — and the expanded view breaks them out separately.
+
+## Configuration
+
+| Item | Location |
+| --- | --- |
+| Toggle (all sessions) | `/mods` pane, or `"plan-bar": false` in `~/.claude/mods/switches.json` |
+| Error log | `~/.claude/mods-logs/plan-bar.log` (last 20 KB) |
+| Persisted plan state | `~/.claude/mods-state/plan-bar-<session-id>.json` — restored on session resume |
+
+## Project layout
+
+```text
+.claude-plugin/
+  plugin.json          Plugin manifest
+  marketplace.json     Single-plugin marketplace definition
+hooks/
+  hooks.json           Module entry point
+  register.tsx         Bar rendering, plan ingestion, timing and token accounting
+  register.test.tsx    Engine tests
+types/
+  index.d.ts           Shared types (BarPlan, BarStep, TokenUsage)
+```
 
 ## License
 
-MIT
+[MIT](LICENSE) © djgp28
