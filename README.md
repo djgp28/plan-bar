@@ -55,18 +55,14 @@ Sessions opened before the install pick it up after `/reload-plugins`.
 
 `plan-bar` reads plan state from the model's own tool calls in the transcript, so mod load order does not matter. Supported sources:
 
-1. `mcp__helper-desk__plan` — provided by the **helper-desk** mod from [Ben AI's Claude Code mods](https://www.benai.co), when installed and enabled.
-2. `TodoWrite` — Claude Code's built-in to-do tool.
-3. `mcp__plan-bar__plan` — a fallback tool `plan-bar` registers itself when helper-desk is absent or disabled. Same schema:
+1. `TodoWrite`: Claude Code's built-in to-do tool.
+2. `mcp__plan-bar__plan`: a plan tool that `plan-bar` registers itself. Schema:
 
    ```ts
    { title?: string; steps: { text: string; status: 'pending' | 'in_progress' | 'completed' }[] }
    ```
 
-   When the fallback is active, `plan-bar` also instructs the model to call it for any task with two or more steps.
-
-> [!TIP]
-> Running helper-desk alongside `plan-bar`? In `/mods`, set **Helper Desk → Hidden** but keep it **On**. Its UI disappears while its plan tool keeps feeding `plan-bar`.
+   `plan-bar` also tells the model to call it for any task with two or more steps.
 
 ## Metrics
 
