@@ -16,11 +16,10 @@ const BAND = {
 
 const MIN = 60_000
 
-/** The engine beneath the plugin: no files on disk, the tools the test names, a placeholder band. */
-function engine(on: On, tools: string[], registered: string[] = [], files: Record<string, string> = {}) {
+/** The engine beneath the plugin: only the files the test names, a placeholder band. */
+function engine(on: On, registered: string[] = [], files: Record<string, string> = {}) {
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: 'sid-1' }))
-  on('tool.list', () => ({ value: tools.map(name => ({ name, description: '', mcp: true })) }))
   on('tool.register', (_, e) => {
     registered.push(e.name)
     return { value: { tool: `mcp__plan-bar__${e.name}` } }
@@ -42,6 +41,10 @@ type Step = { text: string; status: 'pending' | 'in_progress' | 'completed' }
 const S = (...marks: string[]): Step[] =>
   marks.map((m, i) => ({ text: `Step ${i + 1}`, status: m === 'c' ? 'completed' : m === 'i' ? 'in_progress' : 'pending' }))
 
+/** The model calling plan-bar's own plan tool. */
+const plan = ($: { tool: { call: (e: never) => Promise<unknown> } }, input: Record<string, unknown>, agentId?: string) =>
+  $.tool.call({ tool: 'mcp__plan-bar__plan', ...input, ...(agentId ? { agentId } : {}) } as never)
+
 let seq = 0
 /** The model calling a plan tool, as its response row reaches the conversation. */
 function planRow(name: string, input: Record<string, unknown>) {
@@ -58,14 +61,13 @@ function planRow(name: string, input: Record<string, unknown>) {
   }
 }
 
-test("helper-desk's plan calls drive the bar: step, count and time left", async ($, on) => {
+test('plan calls drive the bar: step, count and time left', async ($, on) => {
   const registered: string[] = []
-  const clock = engine(on, ['mcp__helper-desk__plan'], registered)
+  const clock = engine(on, registered)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  // helper-desk serves plans here, so plan-bar adds no tool of its own.
-  expect(registered).toEqual([])
+  expect(registered).toEqual(['plan'])
 
-  await $.session.append(planRow('mcp__helper-desk__plan', { title: 'Ship it', steps: S('i', 'p', 'p', 'p') }))
+  await plan($, { title: 'Ship it', steps: S('i', 'p', 'p', 'p') })
   await clock.settle()
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...BAND, surface })
@@ -77,7 +79,7 @@ test("helper-desk's plan calls drive the bar: step, count and time left", async 
 
   // Step 1 takes a minute: 1 min a step × 3 left.
   await clock.advance(MIN)
-  await $.session.append(planRow('mcp__helper-desk__plan', { title: 'Ship it', steps: S('c', 'i', 'p', 'p') }))
+  await plan($, { title: 'Ship it', steps: S('c', 'i', 'p', 'p') })
   await clock.settle()
   let ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: /^1\/4$/ })).toBeDefined()
@@ -87,7 +89,7 @@ test("helper-desk's plan calls drive the bar: step, count and time left", async 
 
   // Step 2 takes two: 1.5 min a step × 2 left.
   await clock.advance(2 * MIN)
-  await $.session.append(planRow('mcp__helper-desk__plan', { title: 'Ship it', steps: S('c', 'c', 'i', 'p') }))
+  await plan($, { title: 'Ship it', steps: S('c', 'c', 'i', 'p') })
   await clock.settle()
   ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: /^2\/4$/ })).toBeDefined()
@@ -97,9 +99,9 @@ test("helper-desk's plan calls drive the bar: step, count and time left", async 
 })
 
 test('a click pins the details open and a second click closes them', async ($, on) => {
-  engine(on, ['mcp__helper-desk__plan'])
+  engine(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  await $.session.append(planRow('mcp__helper-desk__plan', { title: 'Ship it', steps: S('c', 'i', 'p') }))
+  await plan($, { title: 'Ship it', steps: S('c', 'i', 'p') })
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...BAND, surface })
     expect(await ui.find({ type: 'Text', text: /click the bar to pin/ })).toBeDefined()
@@ -112,7 +114,7 @@ test('a click pins the details open and a second click closes them', async ($, o
 })
 
 test('TodoWrite feeds the bar too', async ($, on) => {
-  engine(on, ['mcp__helper-desk__plan'])
+  engine(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   await $.session.append(
     planRow('TodoWrite', {
@@ -128,9 +130,9 @@ test('TodoWrite feeds the bar too', async ($, on) => {
   await ui.unmount()
 })
 
-test('without helper-desk, plan-bar serves its own plan tool', async ($, on) => {
+test('the plan tool answers with progress and rejects bad steps', async ($, on) => {
   const registered: string[] = []
-  engine(on, [], registered)
+  engine(on, registered)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   expect(registered).toEqual(['plan'])
 
@@ -145,11 +147,11 @@ test('without helper-desk, plan-bar serves its own plan tool', async ($, on) => 
 })
 
 test('a finished plan holds at 100% for 20 s, then the bar goes', async ($, on) => {
-  const clock = engine(on, ['mcp__helper-desk__plan'])
+  const clock = engine(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  await $.session.append(planRow('mcp__helper-desk__plan', { title: 'Ship it', steps: S('i', 'p') }))
+  await plan($, { title: 'Ship it', steps: S('i', 'p') })
   await clock.advance(MIN)
-  await $.session.append(planRow('mcp__helper-desk__plan', { title: 'Ship it', steps: S('c', 'c') }))
+  await plan($, { title: 'Ship it', steps: S('c', 'c') })
   await clock.settle()
   let ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: /^2\/2$/ })).toBeDefined()
@@ -164,17 +166,18 @@ test('a finished plan holds at 100% for 20 s, then the bar goes', async ($, on) 
 })
 
 test('a subagent plan call is not the chat plan', async ($, on) => {
-  engine(on, ['mcp__helper-desk__plan'])
+  engine(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  await $.session.append({ ...planRow('mcp__helper-desk__plan', { steps: S('i', 'p') }), agentId: 'agent-1' })
+  const sub = await plan($, { steps: S('i', 'p') }, 'agent-1')
+  expect(String((sub as { result?: unknown }).result)).toMatch(/main conversation/)
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: /^0\/2$/ })).toBeUndefined()
   await ui.unmount()
 })
 
-test('loaded mid-chat, it picks up the plan helper-desk already holds', async ($, on) => {
-  // helper-desk's own file for this chat: four steps done at once, one in progress.
-  const hd = {
+test('a resumed chat picks up its saved plan', async ($, on) => {
+  // plan-bar's file for this chat: four steps done at once, one in progress.
+  const saved = {
     title: 'Launch checklist',
     steps: [
       ...['A', 'B', 'C', 'D'].map(t => ({ text: `Check ${t}`, status: 'completed', doneAt: '2026-11-03T02:11:43.758Z' })),
@@ -184,7 +187,7 @@ test('loaded mid-chat, it picks up the plan helper-desk already holds', async ($
     ],
     updatedAt: '2026-11-03T02:24:21.719Z',
   }
-  engine(on, ['mcp__helper-desk__plan'], [], { 'mods-state/plan-sid-1.json': JSON.stringify(hd) })
+  engine(on, [], { 'mods-state/plan-bar-sid-1.json': JSON.stringify(saved) })
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: /^4\/7$/ })).toBeDefined()
@@ -194,7 +197,7 @@ test('loaded mid-chat, it picks up the plan helper-desk already holds', async ($
 })
 
 test('tokens: each request goes to the step in progress, subagents included, with a total', async ($, on) => {
-  const clock = engine(on, ['mcp__helper-desk__plan'])
+  const clock = engine(on)
   // The model requests beneath: each answers with the next usage in line.
   const usages = [
     { input_tokens: 100, cache_read_input_tokens: 9000, cache_creation_input_tokens: 400, output_tokens: 500 },
@@ -213,10 +216,10 @@ test('tokens: each request goes to the step in progress, subagents included, wit
     await clock.settle()
   }
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  await $.session.append(planRow('mcp__helper-desk__plan', { title: 'Ship it', steps: S('i', 'p') }))
+  await plan($, { title: 'Ship it', steps: S('i', 'p') })
   await request()
   await request('agent-1')
-  await $.session.append(planRow('mcp__helper-desk__plan', { title: 'Ship it', steps: S('c', 'i') }))
+  await plan($, { title: 'Ship it', steps: S('c', 'i') })
   await request()
 
   for (const surface of ['terminal', 'desktop'] as const) {
@@ -230,12 +233,12 @@ test('tokens: each request goes to the step in progress, subagents included, wit
 })
 
 test('tokens stop counting once the plan is finished', async ($, on) => {
-  const clock = engine(on, ['mcp__helper-desk__plan'])
+  const clock = engine(on)
   on('turn.step', async function* (_, e) {
     return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn' as const, usage: { input_tokens: 5000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 0, model: 'm' } }
   })
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  await $.session.append(planRow('mcp__helper-desk__plan', { title: 'Ship it', steps: S('c', 'c') }))
+  await plan($, { title: 'Ship it', steps: S('c', 'c') })
   const s = $.turn.step({ turnId: 't1', index: 0, model: 'm', messageCount: 1 })
   for await (const _ of s) {
     // nothing streams beneath

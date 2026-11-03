@@ -8,9 +8,8 @@ import type { BarPlan, BarStep, PlanStatus, TokenUsage } from '../types'
 // step × steps left) and the tokens the plan used. Hovering the bar, or clicking it,
 // shows every step with its time and tokens.
 //
-// The plan comes from the model's own calls: helper-desk's mcp__helper-desk__plan and
-// TodoWrite, read from the conversation's rows so the order mods load in never matters.
-// Where helper-desk is off or missing, plan-bar registers a plan tool of the same shape.
+// The plan comes from the model's own calls: plan-bar's mcp__plan-bar__plan tool, and
+// TodoWrite read from the conversation's rows.
 
 const NAME = 'plan-bar'
 // Change the tag when BarPlan's fields change: a reload then starts from an empty plan.
@@ -19,7 +18,6 @@ const openAtom = atom({ plugin: 'plan-bar', key: 'open' } as const, false)
 const nowAtom = atom({ plugin: 'plan-bar', key: 'now' } as const, 0)
 const offAtom = atom({ plugin: 'plan-bar', key: 'off' } as const, false)
 
-const HD_TOOL = 'mcp__helper-desk__plan'
 const OWN_TOOL = 'mcp__plan-bar__plan'
 const STATUSES: readonly PlanStatus[] = ['pending', 'in_progress', 'completed']
 
@@ -60,7 +58,6 @@ type Estimate = {
 // Module variables start over on a reload; the plan itself lives in $.state.
 let home = ''
 let sessionId = ''
-let serveOwn = false
 let off = false
 let busy = false
 let ticker: Timer | null = null
@@ -196,7 +193,6 @@ async function addUsage($: EngineInterface, u: ModelUsage) {
 }
 
 const planFile = () => `${home}/.claude/mods-state/plan-bar-${sessionId}.json`
-const helperDeskFile = () => `${home}/.claude/mods-state/plan-${sessionId}.json`
 
 async function savePlan($: EngineInterface, p: BarPlan | null) {
   if (!p || !home || !sessionId) return
@@ -236,7 +232,7 @@ const time = (v: unknown) => {
   return Number.isFinite(t) ? t : undefined
 }
 
-/** A plan file, plan-bar's own or helper-desk's (doneAt as ISO text, no start). */
+/** plan-bar's plan file for this chat. */
 function fromFile(json: Record<string, unknown>, startedAt: number | null): BarPlan | null {
   const steps: BarStep[] = []
   for (const raw of Array.isArray(json.steps) ? (json.steps as unknown[]) : []) {
@@ -266,20 +262,11 @@ function fromFile(json: Record<string, unknown>, startedAt: number | null): BarP
   }
 }
 
-/** A reload keeps the session's copy; a new process picks up the newest plan file of this chat. */
+/** A reload keeps the session's copy; a new process picks up this chat's plan file. */
 async function loadPlan($: EngineInterface) {
   if ((await read($, planAtom)) || !home || !sessionId) return
   const own = await readJson($, planFile())
-  const hd = await readJson($, helperDeskFile())
-  const ownAt = own ? (time(own.updatedAt) ?? 0) : -1
-  const hdAt = hd ? (time(hd.updatedAt) ?? 0) : -1
-  let p: BarPlan | null = null
-  if (own && ownAt >= hdAt) p = fromFile(own, num(own.startedAt) ?? null)
-  else if (hd) {
-    // helper-desk keeps no start time; the same plan in plan-bar's own file has one.
-    const ownStart = own && own.title === hd.title ? (num(own.startedAt) ?? null) : null
-    p = fromFile(hd, ownStart)
-  }
+  const p = own ? fromFile(own, num(own.startedAt) ?? null) : null
   if (p) await update($, planAtom, () => p)
 }
 
@@ -413,52 +400,41 @@ async function readSwitch($: EngineInterface) {
   syncTicker($, await read($, planAtom))
 }
 
-/** Only where helper-desk's plan tool is missing or switched off does plan-bar offer its own. */
-async function shouldServeOwn($: EngineInterface) {
-  if ((await readSwitches($))['helper-desk'] === false) return true
-  const tools = await $.tool.list().catch(() => null)
-  return !!tools && !tools.some(t => t.name === HD_TOOL)
-}
-
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    // The mods beneath start first, so helper-desk's tool is listed by the time this looks.
     const r = await next(e)
     try {
       home = $.plugin.root.split('/.claude/')[0] ?? ''
       sessionId = await $.session.id().catch(() => '')
       await readSwitch($)
       await loadPlan($)
-      serveOwn = await shouldServeOwn($)
-      if (serveOwn) {
-        await $.tool.register({
-          name: 'plan',
-          description:
-            'Record the ordered steps of the current job and the status of each (pending, in_progress or completed). ' +
-            'The user sees them as a progress bar with a time estimate above the prompt. Always send the full list, not only what changed.',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              title: { type: 'string', description: 'Optional short label for the job.' },
-              steps: {
-                type: 'array',
-                description: 'All steps, first to last.',
-                items: {
-                  type: 'object',
-                  properties: {
-                    text: { type: 'string', description: 'What the step does, briefly.' },
-                    status: { type: 'string', enum: ['pending', 'in_progress', 'completed'] },
-                  },
-                  required: ['text', 'status'],
+      await $.tool.register({
+        name: 'plan',
+        description:
+          'Record the ordered steps of the current job and the status of each (pending, in_progress or completed). ' +
+          'The user sees them as a progress bar with a time estimate above the prompt. Always send the full list, not only what changed.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            title: { type: 'string', description: 'Optional short label for the job.' },
+            steps: {
+              type: 'array',
+              description: 'All steps, first to last.',
+              items: {
+                type: 'object',
+                properties: {
+                  text: { type: 'string', description: 'What the step does, briefly.' },
+                  status: { type: 'string', enum: ['pending', 'in_progress', 'completed'] },
                 },
+                required: ['text', 'status'],
               },
             },
-            required: ['steps'],
           },
-          // Listed up front rather than behind ToolSearch, so the model actually reaches for it.
-          isDeferred: false,
-        })
-      }
+          required: ['steps'],
+        },
+        // Listed up front rather than behind ToolSearch, so the model actually reaches for it.
+        isDeferred: false,
+      })
       switcher?.cancel()
       switcher = $.clock.every(SWITCH_MS, () => {
         void readSwitch($).catch(err => log($, `switch: ${String(err)}`))
@@ -472,24 +448,20 @@ export const register: Register = on => {
     return r
   })
 
-  // The model's plan calls, read off its response rows: helper-desk's tool and TodoWrite.
+  // TodoWrite calls, read off the model's response rows.
   on('session.append', { door: 'response' }, async ($, e, next) => {
     if (!off && !e.agentId) {
       for (const block of e.message.content) {
         if (block.type !== 'tool_use') continue
-        const args = asObject(block.input)
-        if (block.name === HD_TOOL) {
-          const parsed = parsePlan(args)
-          if (typeof parsed !== 'string') void applyPlan($, parsed.title, parsed.steps).catch(err => log($, `plan: ${String(err)}`))
-        } else if (block.name === 'TodoWrite') {
-          void applyPlan($, undefined, parseTodos(args)).catch(err => log($, `todos: ${String(err)}`))
+        if (block.name === 'TodoWrite') {
+          void applyPlan($, undefined, parseTodos(asObject(block.input))).catch(err => log($, `todos: ${String(err)}`))
         }
       }
     }
     return next(e)
   })
 
-  // plan-bar's own plan tool, listed only where helper-desk does not serve plans.
+  // plan-bar's own plan tool.
   // Unfiltered: a typed matcher on an MCP name makes tsc recurse through the connector types.
   on('tool.call', async ($, e, next) => {
     if ((e.tool as string) !== OWN_TOOL) return next(e)
@@ -508,7 +480,7 @@ export const register: Register = on => {
 
   on('prompt.compose', async ($, e, next) => {
     const r = await next(e)
-    if (!serveOwn || off || e.traits.includes('teammate') || e.traits.includes('bare')) return r
+    if (off || e.traits.includes('teammate') || e.traits.includes('bare')) return r
     return { sections: [...r.sections, { id: 'plan-bar:plan', text: PROMPT, scope: 'session' as const }] }
   })
 
