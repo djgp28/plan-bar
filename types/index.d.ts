@@ -12,6 +12,16 @@ export type TokenUsage = {
   output: number
 }
 
+/** A subagent the main chat started. */
+export type BarHelper = {
+  id: string
+  description: string
+  startedAt: number
+  endedAt?: number
+  status: 'working' | 'done' | 'failed'
+  tokens: number
+}
+
 export type BarStep = {
   text: string
   status: PlanStatus
@@ -47,6 +57,8 @@ declare module 'claude-code' {
       now: number
       /** True while switches.json turns the mod off ("plan-bar": false). */
       off: boolean
+      /** Subagents the main chat started, newest last. */
+      agents: Shaped<BarHelper[]>
     }
   }
 }

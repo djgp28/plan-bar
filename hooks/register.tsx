@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ModelUsage, Register, Timer } from 'claude-code'
 
-import type { BarPlan, BarStep, PlanStatus, TokenUsage } from '../types'
+import type { BarHelper, BarPlan, BarStep, PlanStatus, TokenUsage } from '../types'
 
 // plan-bar: one purple progress bar above the prompt. It shows the plan step in
 // progress, steps done out of total, a time estimate (average time per finished
@@ -18,9 +18,7 @@ const openAtom = atom({ plugin: 'plan-bar', key: 'open' } as const, false)
 const nowAtom = atom({ plugin: 'plan-bar', key: 'now' } as const, 0)
 const offAtom = atom({ plugin: 'plan-bar', key: 'off' } as const, false)
 
-/** A subagent the main chat started: what it does, how it is going, what it cost. */
-type Helper = { id: string; description: string; startedAt: number; endedAt?: number; status: 'working' | 'done' | 'failed'; tokens: number }
-const agentsAtom = atom({ plugin: 'plan-bar', key: 'agents' } as const, [] as Helper[], { shape: 'agents-1' })
+const agentsAtom = atom({ plugin: 'plan-bar', key: 'agents' } as const, [] as BarHelper[], { shape: 'agents-1' })
 // The newest ones are kept; older ones fall off.
 const MAX_HELPERS = 20
 // Rows in the details; the rest fold into one "+N more" line.
