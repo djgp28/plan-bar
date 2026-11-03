@@ -18,6 +18,14 @@ const openAtom = atom({ plugin: 'plan-bar', key: 'open' } as const, false)
 const nowAtom = atom({ plugin: 'plan-bar', key: 'now' } as const, 0)
 const offAtom = atom({ plugin: 'plan-bar', key: 'off' } as const, false)
 
+/** A subagent the main chat started: what it does, how it is going, what it cost. */
+type Helper = { id: string; description: string; startedAt: number; endedAt?: number; status: 'working' | 'done' | 'failed'; tokens: number }
+const agentsAtom = atom({ plugin: 'plan-bar', key: 'agents' } as const, [] as Helper[], { shape: 'agents-1' })
+// The newest ones are kept; older ones fall off.
+const MAX_HELPERS = 20
+// Rows in the details; the rest fold into one "+N more" line.
+const HELPER_ROWS = 4
+
 const OWN_TOOL = 'mcp__plan-bar__plan'
 const STATUSES: readonly PlanStatus[] = ['pending', 'in_progress', 'completed']
 
@@ -534,15 +542,55 @@ export const register: Register = on => {
     return next(e)
   })
 
+  // A subagent the main chat starts gets a row in the details.
+  on('agent.spawn', async ($, e, next) => {
+    const r = await next(e)
+    const id = (r as { agentId?: string }).agentId
+    if (!off && id) {
+      void $.clock
+        .now()
+        .then(now =>
+          update($, agentsAtom, list => [
+            ...list.filter(ag => ag.id !== id).slice(-(MAX_HELPERS - 1)),
+            { id, description: oneLine(e.description || '') || 'Subagent', startedAt: now, status: 'working' as const, tokens: 0 },
+          ]),
+        )
+        .catch(err => log($, `spawn: ${String(err)}`))
+    }
+    return r
+  })
+
   // Each model request, the main chat's and every subagent's: its tokens go to the step in progress.
   on('turn.step', async function* ($, e, next) {
     const r = yield* next(e)
-    if (!off && r.usage) void addUsage($, r.usage).catch(err => log($, `tokens: ${String(err)}`))
+    if (!off && r.usage) {
+      void addUsage($, r.usage).catch(err => log($, `tokens: ${String(err)}`))
+      const id = e.agentId
+      if (id) {
+        const u = r.usage
+        const n = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.output_tokens || 0)
+        void update($, agentsAtom, list => (list.some(ag => ag.id === id) ? list.map(ag => (ag.id === id ? { ...ag, tokens: ag.tokens + n } : ag)) : list)).catch(
+          () => undefined,
+        )
+      }
+    }
     return r
   })
 
   on('turn.complete', async ($, e, next) => {
     const r = await next(e)
+    const id = e.agentId
+    if (id) {
+      const status = e.reason === 'error' || e.reason === 'refusal' || e.isAborted ? ('failed' as const) : ('done' as const)
+      void $.clock
+        .now()
+        .then(now =>
+          update($, agentsAtom, list =>
+            list.some(ag => ag.id === id && ag.status === 'working') ? list.map(ag => (ag.id === id && ag.status === 'working' ? { ...ag, status, endedAt: now } : ag)) : list,
+          ),
+        )
+        .catch(() => undefined)
+    }
     if (!e.agentId) {
       busy = false
       syncTicker($, null)
@@ -591,7 +639,11 @@ export const register: Register = on => {
     const usage = p.usage ?? NO_USAGE
     const total = tokenSum(usage)
     const count = `${est.done}/${n}`
-    const tail = ` · ${etaText(est)}${total ? ` · ${tok(total)} tok` : ''} ${isOpen ? '▾' : '▴'}`
+    // Subagents of this plan: a quiet count on the bar while any work, a short list in the details.
+    const helpers = (await read($, agentsAtom)).filter(ag => p.startedAt === null || ag.startedAt >= p.startedAt)
+    const busyHelpers = helpers.filter(ag => ag.status === 'working').length
+    const agentsText = busyHelpers ? ` · ${busyHelpers} agent${busyHelpers === 1 ? '' : 's'}` : ''
+    const tail = ` · ${etaText(est)}${total ? ` · ${tok(total)} tok` : ''}${agentsText} ${isOpen ? '▾' : '▴'}`
     const fixed = 2 + 1 + 1 + count.length + tail.length
     const nameW = Math.max(8, Math.min(36, Math.floor((cols - fixed) * 0.4)))
     const barW = Math.max(6, cols - fixed - nameW)
@@ -618,7 +670,8 @@ export const register: Register = on => {
     // ---- The details: every step with its time, shown on hover or after a click ----
     const inner = Math.max(10, cols - 4)
     const textW = Math.max(4, inner - 2 - TOK_W - TIME_W)
-    const room = Math.max(3, Math.min(14, (e.props.maxRows || 16) - 7))
+    const helperLines = helpers.length ? 1 + Math.min(HELPER_ROWS, helpers.length) + (helpers.length > HELPER_ROWS ? 1 : 0) : 0
+    const room = Math.max(3, Math.min(14, (e.props.maxRows || 16) - 7 - helperLines))
     const focus = curIdx >= 0 ? curIdx : Math.max(0, p.steps.findIndex(s => s.status === 'pending'))
     const from = n <= room ? 0 : Math.max(0, Math.min(n - room, focus - Math.floor(room / 2)))
     const shown = p.steps.slice(from, from + room)
@@ -635,6 +688,37 @@ export const register: Register = on => {
       ? `Tokens: ${tok(total)} total · ${tok(usage.cacheRead)} cache reads · ${tok(usage.input + usage.cacheWrite)} new input · ${tok(usage.output)} output` +
         (other ? ` · ${tok(other)} between steps` : '')
       : 'Tokens: counted from the next model request.'
+
+    // Working ones first, then the most recent; finished ones stay dim.
+    const listed = [...helpers].sort((a, b) => (a.status === 'working' ? 0 : 1) - (b.status === 'working' ? 0 : 1) || b.startedAt - a.startedAt)
+    const helperRows = listed.length ? (
+      <Box flexDirection="column" width={inner}>
+        <Text dimColor wrap="truncate-end">
+          {cut(`Subagents · ${busyHelpers} working · ${listed.length - busyHelpers} finished`, inner)}
+        </Text>
+        {listed.slice(0, HELPER_ROWS).map(ag => {
+          const live = ag.status === 'working'
+          const mark = live ? spin : ag.status === 'done' ? '✓' : '✗'
+          return (
+            <Box flexDirection="row" width={inner}>
+              <Text color={live ? P_MID : undefined} dimColor={!live}>{`  ${mark} `}</Text>
+              <Box width={Math.max(4, textW - 2)}>
+                <Text dimColor={!live} wrap="truncate-end">
+                  {cut(ag.description, Math.max(4, textW - 2))}
+                </Text>
+              </Box>
+              <Box width={TOK_W} justifyContent="flex-end">
+                <Text dimColor>{ag.tokens ? `${tok(ag.tokens)} tok` : ''}</Text>
+              </Box>
+              <Box width={TIME_W} justifyContent="flex-end">
+                <Text dimColor>{dur(Math.max(0, (ag.endedAt ?? now) - ag.startedAt))}</Text>
+              </Box>
+            </Box>
+          )
+        })}
+        {listed.length > HELPER_ROWS ? <Text dimColor>{`    +${listed.length - HELPER_ROWS} more`}</Text> : null}
+      </Box>
+    ) : null
 
     const details = (
       <Box
@@ -690,6 +774,7 @@ export const register: Register = on => {
           )
         })}
         {from + room < n ? <Text dimColor>{`  ↓ ${n - from - room} more`}</Text> : null}
+        {helperRows}
         <Text color={P_MID} wrap="truncate-end">
           {cut(tokLine, inner)}
         </Text>

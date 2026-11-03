@@ -33,6 +33,11 @@ function engine(on: On, registered: string[] = [], files: Record<string, string>
   on('fs.write', () => ({ value: undefined }))
   on('process.run', () => ({ value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  let spawned = 0
+  on('agent.spawn', () => {
+    spawned += 1
+    return { model: 'claude-opus-5-5', agentId: `agent-${spawned}` } as never
+  })
   on('ui.toast', (_, e) => {
     toasts.push((e as { text: string }).text)
     return { value: undefined }
@@ -279,4 +284,52 @@ test('a finished step and a finished plan each raise a toast', async ($, on) => 
   await plan($, { title: 'Ship it', steps: S('c', 'c', 'c') })
   await clock.settle()
   expect(toasts).toHaveLength(2)
+})
+
+test('subagents: a quiet count on the bar while they work, a short list in the details', async ($, on) => {
+  const clock = engine(on)
+  on('turn.step', async function* (_, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn' as const, usage: { input_tokens: 2000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 0, model: 'm' } }
+  })
+  on('turn.complete', async () => ({ text: '' }) as never)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await plan($, { title: 'Ship it', steps: S('i', 'p') })
+
+  // No subagents yet: the bar says nothing about them.
+  let ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /agent/ })).toBeUndefined()
+  await ui.unmount()
+
+  await $.agent.spawn({ tool_use_id: 's1', prompt: 'x', description: 'Read the docs', subagentType: 'Explore' } as never)
+  await $.agent.spawn({ tool_use_id: 's2', prompt: 'x', description: 'Write the tests', subagentType: 'general-purpose' } as never)
+  await clock.settle()
+  const s = $.turn.step({ turnId: 'a1', index: 0, model: 'm', messageCount: 1, agentId: 'agent-1' })
+  for await (const _ of s) {
+    // nothing streams beneath
+  }
+  await clock.advance(30_000)
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    ui = await $.ui.mount({ ...BAND, surface })
+    expect(await ui.find({ type: 'Text', text: /· 2 agents ▴$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /Subagents · 2 working · 0 finished/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /Read the docs/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^2\.0k tok$/ })).toBeDefined()
+    await ui.unmount()
+  }
+
+  // One finishes: the bar counts only the one still working.
+  await $.turn.complete({ answer: 'ok', agentId: 'agent-1', reason: 'answer', durationMs: 1, isAborted: false, turnId: 'a1' } as never)
+  await clock.settle()
+  ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /· 1 agent ▴$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Subagents · 1 working · 1 finished/ })).toBeDefined()
+  await ui.unmount()
+
+  await $.turn.complete({ answer: 'ok', agentId: 'agent-2', reason: 'answer', durationMs: 1, isAborted: false, turnId: 'a2' } as never)
+  await clock.settle()
+  ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /agents? ▴$/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /Subagents · 0 working · 2 finished/ })).toBeDefined()
+  await ui.unmount()
 })
