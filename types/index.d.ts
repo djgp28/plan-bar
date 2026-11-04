@@ -22,6 +22,14 @@ export type BarHelper = {
   tokens: number
 }
 
+/** A smaller piece of one step, so the bar moves while a long step runs. */
+export type BarSub = {
+  text: string
+  status: PlanStatus
+  /** Clock time (ms) the substep was first seen completed. */
+  doneAt?: number
+}
+
 export type BarStep = {
   text: string
   status: PlanStatus
@@ -31,6 +39,8 @@ export type BarStep = {
   doneAt?: number
   /** Tokens of every model request (subagents' included) made while this step was in progress. */
   tokens?: number
+  /** The step's substeps, when the model sent any. */
+  substeps?: BarSub[]
 }
 
 export type BarPlan = {
@@ -44,6 +54,8 @@ export type BarPlan = {
   usage?: TokenUsage
   /** Tokens used while the plan was open but no step was in progress. */
   otherTokens?: number
+  /** Clock time (ms) of the last plan call: how long the bar has gone without news. */
+  updatedAt?: number
 }
 
 declare module 'claude-code' {

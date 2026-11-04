@@ -333,3 +333,138 @@ test('subagents: a quiet count on the bar while they work, a short list in the d
   expect(await ui.find({ type: 'Text', text: /Subagents · 0 working · 2 finished/ })).toBeDefined()
   await ui.unmount()
 })
+
+// ---------- 0.5: substeps and reminders ----------
+
+/** The engine answers every other tool call with a plain result. */
+function tools(on: On) {
+  on('tool.call', () => ({ result: 'ok' }) as never)
+  on('prompt.submit', (_, e) => e as never)
+}
+const noteOf = (r: unknown) => ((r as { context?: string[] }).context ?? []).join('\n')
+const bash = ($: { tool: { call: (e: never) => Promise<unknown> } }) => $.tool.call({ tool: 'Bash', command: 'ls' } as never)
+
+test('substeps move the bar inside a long step', async ($, on) => {
+  const clock = engine(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const subs = (k: number) => ['A', 'B', 'C', 'D'].map((t, i) => ({ text: `Sub ${t}`, status: i < k ? 'completed' : i === k ? 'in_progress' : 'pending' }))
+  await plan($, { title: 'Big job', steps: [{ text: 'Map the gaps', status: 'in_progress', substeps: subs(0) }, { text: 'Write it up', status: 'pending' }] })
+  await clock.advance(2 * MIN)
+  const r = await plan($, { title: 'Big job', steps: [{ text: 'Map the gaps', status: 'in_progress', substeps: subs(2) }, { text: 'Write it up', status: 'pending' }] })
+  expect(String((r as { result?: unknown }).result)).toBe('Saved. Progress: 0/2 steps complete, 25% overall (current step: 2/4 substeps).')
+  await clock.settle()
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /Map the gaps › Sub C/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^0\/2$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^ ·2\/4$/ })).toBeDefined()
+  // 1 min per substep: 2 left here, then one more step of ~4 min.
+  expect(await ui.find({ type: 'Text', text: /~6m left/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /0 of 2 done · 25%/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Map the gaps \(2\/4\)/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^Sub D$/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('reminders repeat every 10 tool calls until the plan is updated', async ($, on) => {
+  const clock = engine(on)
+  tools(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await plan($, { title: 'Ship it', steps: S('i', 'p', 'p') })
+  const notes: string[] = []
+  for (let k = 0; k < 25; k++) {
+    notes.push(noteOf(await bash($)))
+    await clock.advance(1000)
+  }
+  const fired = notes.map((n, k) => (n ? k + 1 : 0)).filter(Boolean)
+  expect(fired).toEqual([10, 20])
+  expect(notes[9]).toMatch(/has not been updated for .* and 10 tool calls, so the user's progress bar is stuck at 0% on "Step 1"/)
+  expect(notes[9]).toMatch(/mcp__plan-bar__plan/)
+  expect(notes[19]).toMatch(/repeats until the plan is updated/)
+
+  // An update starts the count again.
+  await plan($, { title: 'Ship it', steps: S('c', 'i', 'p') })
+  for (let k = 0; k < 9; k++) expect(noteOf(await bash($))).toBe('')
+  expect(noteOf(await bash($))).toMatch(/stuck at 33% on "Step 2"/)
+})
+
+test('reminders also come with time, and a long step is told to get substeps', async ($, on) => {
+  const clock = engine(on)
+  tools(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await plan($, { title: 'Ship it', steps: S('i', 'p') })
+  expect(noteOf(await bash($))).toBe('')
+  // One long call (a subagent, a big build): 11 minutes.
+  await clock.advance(11 * MIN)
+  const first = noteOf(await bash($))
+  expect(first).toMatch(/has not been updated for 11m and 2 tool calls/)
+  expect(first).not.toMatch(/substeps/)
+  expect(noteOf(await bash($))).toBe('')
+  await clock.advance(10 * MIN)
+  expect(noteOf(await bash($))).toMatch(/This step has run 21m: give it substeps/)
+})
+
+test('a new request with a plan still open asks to carry it on or replace it', async ($, on) => {
+  engine(on)
+  tools(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await plan($, { title: 'Ship it', steps: S('c', 'i', 'p') })
+  await $.prompt.submit({ text: 'and now the docs' } as never)
+  expect(noteOf(await bash($))).toMatch(/a plan is still open \("Ship it", 1\/3 steps, 33%, on "Step 2"\)/)
+  expect(noteOf(await bash($))).toBe('')
+})
+
+test('no plan: one reminder per request, after two tool calls', async ($, on) => {
+  engine(on)
+  tools(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ text: 'do the thing' } as never)
+  expect(noteOf(await bash($))).toBe('')
+  expect(noteOf(await bash($))).toMatch(/this task has no plan yet/)
+  for (let k = 0; k < 12; k++) expect(noteOf(await bash($))).toBe('')
+})
+
+test('the bar flags a plan that has gone quiet for 15 minutes', async ($, on) => {
+  const clock = engine(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await plan($, { title: 'Ship it', steps: S('i', 'p') })
+  await clock.advance(5 * MIN)
+  let ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /no update/ })).toBeUndefined()
+  await ui.unmount()
+  await clock.advance(12 * MIN)
+  ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /⚠ no update 17m/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test("helper-desk's plan calls feed the bar, and reminders name its tool", async ($, on) => {
+  engine(on)
+  tools(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.session.append(planRow('mcp__helper-desk__plan', { title: 'HD plan', steps: S('c', 'i', 'p', 'p') }))
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^1\/4$/ })).toBeDefined()
+  await ui.unmount()
+  const notes: string[] = []
+  for (let k = 0; k < 10; k++) notes.push(noteOf(await bash($)))
+  expect(notes[9]).toMatch(/Call mcp__helper-desk__plan now/)
+})
+
+test('a saved plan keeps its substeps and when it was last updated', async ($, on) => {
+  const saved = {
+    title: 'Big job',
+    startedAt: 1_000_000 - 30 * MIN,
+    planUpdatedAt: 1_000_000 - 20 * MIN,
+    steps: [
+      { text: 'Map the gaps', status: 'in_progress', startedAt: 1_000_000 - 30 * MIN, substeps: [{ text: 'Wave 0', status: 'completed', doneAt: 1_000_000 - 25 * MIN }, { text: 'Wave 1', status: 'in_progress' }] },
+      { text: 'Write it up', status: 'pending' },
+    ],
+  }
+  engine(on, [], { 'mods-state/plan-bar-sid-1.json': JSON.stringify(saved) })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...BAND, props: { ...BAND.props, bodyColumns: 140 }, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /Map the gaps › Wave 1/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^ ·1\/2$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /⚠ no update 20m/ })).toBeDefined()
+  await ui.unmount()
+})

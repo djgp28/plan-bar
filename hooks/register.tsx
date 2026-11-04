@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ModelUsage, Register, Timer } from 'claude-code'
 
-import type { BarHelper, BarPlan, BarStep, PlanStatus, TokenUsage } from '../types'
+import type { BarHelper, BarPlan, BarStep, BarSub, PlanStatus, TokenUsage } from '../types'
 
 // plan-bar: one purple progress bar above the prompt. It shows the plan step in
 // progress, steps done out of total, a time estimate (average time per finished
@@ -25,6 +25,8 @@ const MAX_HELPERS = 20
 const HELPER_ROWS = 4
 
 const OWN_TOOL = 'mcp__plan-bar__plan'
+// helper-desk's plan tool of the same shape: its calls feed the bar too.
+const HD_TOOL = 'mcp__helper-desk__plan'
 const STATUSES: readonly PlanStatus[] = ['pending', 'in_progress', 'completed']
 
 const TICK_MS = 500
@@ -43,10 +45,25 @@ const SPIN = ['◐', '◓', '◑', '◒']
 const PROMPT =
   'Track multi-step work with the mcp__plan-bar__plan tool: the user sees it as a progress bar with an estimated finish time. ' +
   'Before starting a task that takes two or more steps or tool calls, send the complete ordered list of steps, the first marked in_progress. ' +
-  'Whenever a step is finished or another begins, send the complete list again with updated statuses, and mark the final step completed before your closing reply. ' +
-  'Count a batch of subagents as one step. Only a one-line answer that uses no tools needs no plan.'
+  'Make the plan detailed enough to keep moving: each step should be a concrete piece of work that finishes within about 10 tool calls or 15 minutes. ' +
+  'A step that will take longer gets substeps (substeps: [{ text, status }]), and when the work turns out bigger than planned, split the step or add steps and substeps. ' +
+  'Send the complete list again every time a step or substep finishes or another begins, not only at the end, and mark the final step completed before your closing reply. ' +
+  'A batch of subagents is one step, with one substep per subagent. Only a one-line answer that uses no tools needs no plan.'
 
-type StepIn = { text: string; status: PlanStatus }
+// ---- Reminders to the model, read after a tool result; the user never sees them ----
+// Main-chat tool calls with no plan before the first reminder to make one.
+const NEW_AFTER = 2
+// Tool calls, or time, without a plan update before each reminder to send one. They repeat.
+const STALE_CALLS = 10
+const STALE_MS = 10 * 60_000
+// A step running this long with no substeps is told to get some.
+const LONG_STEP_MS = 15 * 60_000
+// The bar flags a plan this long without an update.
+const STALE_SHOW_MS = 15 * 60_000
+const P_WARN = '#f59e0b'
+
+type SubIn = { text: string; status: PlanStatus }
+type StepIn = { text: string; status: PlanStatus; substeps?: SubIn[] }
 type Run = { text: string; color?: string; dim?: boolean }
 type Estimate = {
   done: number
@@ -59,6 +76,8 @@ type Estimate = {
   last: number | null
   /** Each step's own time, null where it is not known (or not done). */
   spent: (number | null)[]
+  /** How far the plan is, 0 to 1, counting the substeps done inside unfinished steps. */
+  progress: number
 }
 
 // Module variables start over on a reload; the plan itself lives in $.state.
@@ -70,6 +89,16 @@ let ticker: Timer | null = null
 let switcher: Timer | null = null
 let holdTimer: Timer | null = null
 let stateDirMade = false
+// The reminders: main-chat tool calls this prompt and since the last plan update, and the last reminder.
+let turnCalls = 0
+let turnPlanned = false
+let turnNudged = false
+let callsSince = 0
+let nudgeMark = 0
+let lastNudgeAt = 0
+let nudges = 0
+// The tool the model last kept its plan with; reminders name it.
+let planTool = OWN_TOOL
 
 /** At most `max` characters, an ellipsis standing for what was dropped. */
 function cut(s: string, max: number) {
@@ -107,7 +136,20 @@ function parsePlan(args: Record<string, unknown>): { title?: string; steps: Step
     const text = typeof st.text === 'string' ? oneLine(st.text) : ''
     if (!text) return 'No plan saved: one of the steps has no text.'
     if (!isStatus(st.status)) return `No plan saved: step "${cut(text, 40)}" has no valid status (use pending, in_progress or completed).`
-    steps.push({ text, status: st.status })
+    const step: StepIn = { text, status: st.status }
+    if (Array.isArray(st.substeps)) {
+      const subs: SubIn[] = []
+      for (const rawSub of st.substeps as unknown[]) {
+        const sb = asObject(rawSub)
+        const subText = typeof sb.text === 'string' ? oneLine(sb.text) : ''
+        if (!subText) return `No plan saved: a substep of "${cut(text, 40)}" has no text.`
+        if (!isStatus(sb.status)) return `No plan saved: substep "${cut(subText, 40)}" has no valid status (use pending, in_progress or completed).`
+        // A finished step finished all of its substeps.
+        subs.push({ text: subText, status: st.status === 'completed' ? 'completed' : sb.status })
+      }
+      if (subs.length) step.substeps = subs
+    }
+    steps.push(step)
   }
   const title = typeof args.title === 'string' ? oneLine(args.title) : ''
   return title ? { title, steps } : { steps }
@@ -125,15 +167,12 @@ function parseTodos(args: Record<string, unknown>): StepIn[] {
   return steps
 }
 
-/**
- * The new list laid over the old one: a step keeps its times while its text stays the
- * same. A list with work left in it after a finished plan starts a new plan.
- */
 /** A list with work left in it after a finished plan (or with no plan before) starts a new plan. */
 function isFresh(old: BarPlan | null, incoming: readonly StepIn[]) {
   return !old || !old.steps.length || (allDone(old.steps) && !allDone(incoming))
 }
 
+/** The new list laid over the old one: a step (and a substep) keeps its times while its text stays the same. */
 function merge(old: BarPlan | null, title: string | undefined, incoming: readonly StepIn[], now: number): BarPlan {
   const nowDone = allDone(incoming)
   const wasDone = !!old && allDone(old.steps)
@@ -147,12 +186,23 @@ function merge(old: BarPlan | null, title: string | undefined, incoming: readonl
     if (st.status !== 'pending') step.startedAt = was?.startedAt ?? now
     if (st.status === 'completed') step.doneAt = was?.status === 'completed' && was.doneAt !== undefined ? was.doneAt : now
     if (was?.tokens) step.tokens = was.tokens
+    if (st.substeps?.length) {
+      const subsByText = new Map<string, BarSub[]>()
+      for (const o of was?.substeps ?? []) subsByText.set(o.text, [...(subsByText.get(o.text) ?? []), o])
+      step.substeps = st.substeps.map(sb => {
+        const prev = subsByText.get(sb.text)?.shift()
+        const sub: BarSub = { text: sb.text, status: sb.status }
+        if (sb.status === 'completed') sub.doneAt = prev?.status === 'completed' && prev.doneAt !== undefined ? prev.doneAt : now
+        return sub
+      })
+    }
     return step
   })
   const keep = !fresh && old ? old : null
   return {
     title: title || keep?.title || 'Plan',
     steps,
+    updatedAt: now,
     startedAt: keep ? keep.startedAt : now,
     // A finished plan sent again keeps whether it still shows.
     shown: keep && wasDone && nowDone ? keep.shown : steps.length > 0,
@@ -218,6 +268,7 @@ async function savePlan($: EngineInterface, p: BarPlan | null) {
       startedAt: p.startedAt,
       ...(p.usage ? { usage: p.usage } : {}),
       ...(p.otherTokens ? { otherTokens: p.otherTokens } : {}),
+      ...(p.updatedAt ? { planUpdatedAt: p.updatedAt } : {}),
       updatedAt: await $.clock.now(),
     }
     await $.fs.write(planFile(), `${JSON.stringify(body, null, 2)}\n`)
@@ -256,17 +307,29 @@ function fromFile(json: Record<string, unknown>, startedAt: number | null): BarP
     if (d !== undefined && st.status === 'completed') step.doneAt = d
     const tk = num(st.tokens)
     if (tk) step.tokens = tk
+    const subs: BarSub[] = []
+    for (const rawSub of Array.isArray(st.substeps) ? (st.substeps as unknown[]) : []) {
+      const sb = asObject(rawSub)
+      if (typeof sb.text !== 'string' || !isStatus(sb.status)) continue
+      const sub: BarSub = { text: sb.text, status: sb.status }
+      const sd = time(sb.doneAt)
+      if (sd !== undefined && sb.status === 'completed') sub.doneAt = sd
+      subs.push(sub)
+    }
+    if (subs.length) step.substeps = subs
     steps.push(step)
   }
   if (!steps.length) return null
   const title = typeof json.title === 'string' && json.title ? json.title : 'Plan'
   const usage = usageOf(json.usage)
   const other = num(json.otherTokens)
+  const updatedAt = time(json.planUpdatedAt) ?? time(json.updatedAt)
   // A plan that had finished before stays out of sight.
   return {
     title,
     steps,
     startedAt,
+    ...(updatedAt ? { updatedAt } : {}),
     shown: !allDone(steps),
     ...(tokenSum(usage) ? { usage } : {}),
     ...(other ? { otherTokens: other } : {}),
@@ -282,6 +345,31 @@ async function loadPlan($: EngineInterface) {
 }
 
 // ---------- Times ----------
+
+/** A step's share of done: 1 once completed, else the part of its substeps done (never all of it). */
+function share(s: BarStep) {
+  if (s.status === 'completed') return 1
+  const subs = s.substeps
+  if (!subs?.length) return 0
+  return Math.min(0.95, doneCount(subs) / subs.length)
+}
+const progressOf = (steps: readonly BarStep[]) => (steps.length ? steps.reduce((a, s) => a + share(s), 0) / steps.length : 0)
+
+/** Each substep's own time: from the substep done before it, or from the step's start. */
+function subSpent(step: BarStep): (number | null)[] {
+  const subs = step.substeps ?? []
+  const out: (number | null)[] = subs.map(() => null)
+  const order = subs
+    .map((sb, j) => ({ j, at: sb.status === 'completed' ? sb.doneAt : undefined }))
+    .filter((x): x is { j: number; at: number } => typeof x.at === 'number')
+    .sort((a, b) => a.at - b.at)
+  let prev = step.startedAt ?? null
+  for (const { j, at } of order) {
+    out[j] = prev === null ? null : Math.max(0, at - prev)
+    prev = at
+  }
+  return out
+}
 
 function estimate(p: BarPlan): Estimate {
   const n = p.steps.length
@@ -303,7 +391,21 @@ function estimate(p: BarPlan): Estimate {
   const anchor = p.startedAt ?? (order.length ? order[0]!.at : null)
   const timed = anchor === null ? 0 : order.filter(x => x.at > anchor).length
   const avg = anchor !== null && last !== null && timed > 0 ? (last - anchor) / timed : null
-  return { done, left, avg, eta: avg === null ? null : avg * left, last, spent }
+  let eta = avg === null ? null : avg * left
+  // Inside a step with substeps: its substeps left at their own pace, then the steps after it.
+  const cur = p.steps.find(s => s.status === 'in_progress')
+  const subs = cur?.substeps
+  const curStart = cur?.startedAt
+  if (cur && subs?.length && curStart !== undefined) {
+    const timedSubs = subs.filter(sb => sb.status === 'completed' && sb.doneAt !== undefined && sb.doneAt > curStart)
+    if (timedSubs.length) {
+      const lastSub = Math.max(...timedSubs.map(sb => sb.doneAt!))
+      const subAvg = (lastSub - curStart) / timedSubs.length
+      const subsLeft = subs.length - doneCount(subs)
+      eta = subAvg * subsLeft + Math.max(0, left - 1) * (avg ?? subAvg * subs.length)
+    }
+  }
+  return { done, left, avg, eta, last, spent, progress: progressOf(p.steps) }
 }
 
 function dur(ms: number) {
@@ -344,14 +446,14 @@ function blend(from: string, to: string, t: number) {
 }
 
 /** The bar in runs of one colour: a purple gradient for done steps, a shimmer over the step in progress, a dim track for the rest. */
-function barRuns(width: number, n: number, done: number, live: boolean, frame: number | null): Run[] {
+function barRuns(width: number, n: number, done: number, progress: number, live: boolean, frame: number | null): Run[] {
   const runs: Run[] = []
   const push = (ch: string, color?: string, dim?: boolean) => {
     const lastRun = runs[runs.length - 1]
     if (lastRun && lastRun.color === color && lastRun.dim === dim && lastRun.text[0] === ch) lastRun.text += ch
     else runs.push({ text: ch, ...(color ? { color } : {}), ...(dim ? { dim } : {}) })
   }
-  const fill = Math.min(width, Math.round((width * done) / n))
+  const fill = Math.min(width, Math.round(width * progress))
   const liveC = live ? Math.min(width - fill, Math.max(1, Math.round((width * Math.min(n, done + 1)) / n) - fill)) : 0
   for (let i = 0; i < fill; i++) push('█', blend(P_LIGHT, P_DEEP, Math.round((fill > 1 ? i / (fill - 1) : 1) * 5) / 5))
   const glow = frame === null || !liveC ? -1 : frame % liveC
@@ -414,6 +516,94 @@ function toast($: EngineInterface, text: string) {
   }
 }
 
+// ---------- Reminders ----------
+
+const pct = (p: BarPlan) => `${Math.round(progressOf(p.steps) * 100)}%`
+const supportsSubsteps = (tool: string) => tool === OWN_TOOL
+
+/** How the model should make a long step move, in the words of the tool it uses. */
+function splitHint(tool: string) {
+  if (supportsSubsteps(tool)) return 'give it substeps (substeps: [{ text, status }]) or split it into smaller steps, so the bar moves while it runs'
+  if (tool === 'TodoWrite') return 'split it into smaller to-do items, so the bar moves while it runs'
+  return 'split it into smaller steps, so the bar moves while it runs'
+}
+
+function staleNote(p: BarPlan, now: number) {
+  const cur = p.steps.find(s => s.status === 'in_progress')
+  const since = p.updatedAt === undefined ? null : now - p.updatedAt
+  const quiet = since === null ? `${callsSince} tool calls` : `${dur(since)} and ${callsSince} tool calls`
+  let text =
+    `plan-bar: the plan has not been updated for ${quiet}, so the user's progress bar is stuck at ${pct(p)}` +
+    `${cur ? ` on "${cut(cur.text, 80)}"` : ''}. Call ${planTool} now with the full list: mark every finished step${supportsSubsteps(planTool) ? ' and substep' : ''} completed and the current one in_progress.`
+  const ranFor = cur?.startedAt === undefined ? 0 : now - cur.startedAt
+  if (cur && ranFor >= LONG_STEP_MS && !cur.substeps?.length) text += ` This step has run ${dur(ranFor)}: ${splitHint(planTool)}.`
+  if (nudges >= 2) text += ' This reminder repeats until the plan is updated.'
+  return text
+}
+
+/** The reminder this main-chat tool call should carry, if any. */
+async function nudgeFor($: EngineInterface): Promise<string | null> {
+  turnCalls++
+  callsSince++
+  const p = await read($, planAtom)
+  const live = !!p && p.shown && p.steps.length > 0 && !allDone(p.steps)
+  const now = await $.clock.now()
+  const mark = () => {
+    turnNudged = true
+    lastNudgeAt = now
+    nudgeMark = callsSince
+  }
+  if (!turnPlanned && !turnNudged) {
+    if (live) {
+      // A new request while a plan is open: continue it or replace it.
+      mark()
+      const cur = p.steps.find(s => s.status === 'in_progress')
+      return (
+        `plan-bar: a plan is still open ("${cut(p.title, 60)}", ${doneCount(p.steps)}/${p.steps.length} steps, ${pct(p)}${cur ? `, on "${cut(cur.text, 60)}"` : ''}). ` +
+        `If this request carries it on, send the updated list with ${planTool}; if it is a new task, send its own plan.`
+      )
+    }
+    if (turnCalls >= NEW_AFTER) {
+      mark()
+      return `plan-bar: this task has no plan yet. If it takes more than a couple of tool calls, call ${OWN_TOOL} now with every step in order (the first in_progress), detailed enough that a step finishes every few minutes.`
+    }
+    return null
+  }
+  if (!live) return null
+  // Repeats: every STALE_CALLS tool calls or STALE_MS since the last update or reminder, whichever comes first.
+  const ref = Math.max(p.updatedAt ?? 0, lastNudgeAt)
+  if (callsSince - nudgeMark >= STALE_CALLS || (ref > 0 && now - ref >= STALE_MS)) {
+    mark()
+    nudges++
+    return staleNote(p, now)
+  }
+  return null
+}
+
+/** A plan came in, from any tool: the reminders count from zero. */
+function planned(tool: string) {
+  planTool = tool
+  turnPlanned = true
+  callsSince = 0
+  nudgeMark = 0
+  lastNudgeAt = 0
+  nudges = 0
+}
+
+/** The tool's answer: progress, and a hint when the step in progress is long and has no substeps. */
+function answer(p: BarPlan | null, now: number) {
+  if (!p) return 'Saved.'
+  const n = p.steps.length
+  const done = doneCount(p.steps)
+  const cur = p.steps.find(s => s.status === 'in_progress')
+  const subs = cur?.substeps
+  let text = `Saved. Progress: ${done}/${n} steps complete`
+  text += subs?.length ? `, ${pct(p)} overall (current step: ${doneCount(subs)}/${subs.length} substeps).` : '.'
+  const ranFor = cur?.startedAt === undefined ? 0 : now - cur.startedAt
+  if (cur && !subs?.length && ranFor >= LONG_STEP_MS) text += ` "${cut(cur.text, 60)}" has been in progress for ${dur(ranFor)}: ${splitHint(OWN_TOOL)}.`
+  return text
+}
+
 async function applyPlan($: EngineInterface, title: string | undefined, incoming: readonly StepIn[]) {
   const now = await $.clock.now()
   let said: string | null = null
@@ -430,6 +620,7 @@ async function applyPlan($: EngineInterface, title: string | undefined, incoming
   await update($, nowAtom, () => now)
   syncTicker($, p)
   await savePlan($, p)
+  return answer(p, now)
 }
 
 async function readSwitches($: EngineInterface) {
@@ -457,7 +648,8 @@ export const register: Register = on => {
         name: 'plan',
         description:
           'Record the ordered steps of the current job and the status of each (pending, in_progress or completed). ' +
-          'The user sees them as a progress bar with a time estimate above the prompt. Always send the full list, not only what changed.',
+          'The user sees them as a progress bar with a time estimate above the prompt. Always send the full list, not only what changed. ' +
+          'A long step can carry substeps; the bar moves as each one is completed. Update it each time a step or substep finishes.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -470,6 +662,18 @@ export const register: Register = on => {
                 properties: {
                   text: { type: 'string', description: 'What the step does, briefly.' },
                   status: { type: 'string', enum: ['pending', 'in_progress', 'completed'] },
+                  substeps: {
+                    type: 'array',
+                    description: 'Optional: the smaller pieces of a step that takes more than ~15 minutes or ~10 tool calls.',
+                    items: {
+                      type: 'object',
+                      properties: {
+                        text: { type: 'string', description: 'What the substep does, briefly.' },
+                        status: { type: 'string', enum: ['pending', 'in_progress', 'completed'] },
+                      },
+                      required: ['text', 'status'],
+                    },
+                  },
                 },
                 required: ['text', 'status'],
               },
@@ -493,13 +697,19 @@ export const register: Register = on => {
     return r
   })
 
-  // TodoWrite calls, read off the model's response rows.
+  // TodoWrite and helper-desk's plan calls, read off the model's response rows.
   on('session.append', { door: 'response' }, async ($, e, next) => {
     if (!off && !e.agentId) {
       for (const block of e.message.content) {
         if (block.type !== 'tool_use') continue
         if (block.name === 'TodoWrite') {
+          planned('TodoWrite')
           void applyPlan($, undefined, parseTodos(asObject(block.input))).catch(err => log($, `todos: ${String(err)}`))
+        } else if (block.name === HD_TOOL) {
+          const parsed = parsePlan(asObject(block.input))
+          if (typeof parsed === 'string') continue
+          planned(HD_TOOL)
+          void applyPlan($, parsed.title, parsed.steps).catch(err => log($, `helper-desk plan: ${String(err)}`))
         }
       }
     }
@@ -509,18 +719,40 @@ export const register: Register = on => {
   // plan-bar's own plan tool.
   // Unfiltered: a typed matcher on an MCP name makes tsc recurse through the connector types.
   on('tool.call', async ($, e, next) => {
-    if ((e.tool as string) !== OWN_TOOL) return next(e)
+    const tool = e.tool as string
+    if (tool !== OWN_TOOL) {
+      // Plan tools of others are read from the response rows; every other main-chat call may carry a reminder.
+      if (off || e.agentId || tool === 'TodoWrite' || tool === HD_TOOL) return next(e)
+      const r = await next(e)
+      let note: string | null = null
+      try {
+        note = await nudgeFor($)
+      } catch (err) {
+        await log($, `nudge: ${String(err)}`)
+      }
+      if (!note || !r || typeof r !== 'object' || typeof (r as { deny?: unknown }).deny === 'string') return r
+      const had = (r as { context?: readonly string[] }).context ?? []
+      return { ...r, context: [...had, note] } as never
+    }
     if (off) return { result: 'plan-bar is switched off, so nothing was saved. Continue without a plan.' } as never
     if (e.agentId) return { result: 'Plans belong to the main conversation; a subagent can continue without one.' } as never
     const parsed = parsePlan(e as unknown as Record<string, unknown>)
     if (typeof parsed === 'string') return { result: parsed } as never
+    planned(OWN_TOOL)
     try {
-      await applyPlan($, parsed.title, parsed.steps)
+      return { result: await applyPlan($, parsed.title, parsed.steps) } as never
     } catch (err) {
       await log($, `own plan: ${String(err)}`)
       return { result: 'Could not save the plan (internal error). Continue with the task.' } as never
     }
-    return { result: `Saved. Progress: ${doneCount(parsed.steps)}/${parsed.steps.length} steps complete.` } as never
+  })
+
+  // A new request: the per-request reminders count from zero (the stale ones keep counting).
+  on('prompt.submit', async ($, e, next) => {
+    turnCalls = 0
+    turnPlanned = false
+    turnNudged = false
+    return next(e)
   })
 
   on('prompt.compose', async ($, e, next) => {
@@ -631,21 +863,36 @@ export const register: Register = on => {
     const curIdx = p.steps.findIndex(s => s.status === 'in_progress')
     const cur = curIdx >= 0 ? p.steps[curIdx] : undefined
     const nextUp = p.steps.find(s => s.status === 'pending')
-    const label = cur ? cur.text : finished ? 'All steps done' : nextUp ? `Next: ${nextUp.text}` : p.title
+    const subs = cur?.substeps ?? []
+    const curSub = subs.find(sb => sb.status === 'in_progress') ?? subs.find(sb => sb.status === 'pending')
 
     // ---- The bar: glyph, step name, bar, done/total · time left · tokens, caret ----
     const usage = p.usage ?? NO_USAGE
     const total = tokenSum(usage)
     const count = `${est.done}/${n}`
+    const subCount = subs.length ? ` ·${doneCount(subs)}/${subs.length}` : ''
+    // A plan that has gone quiet while the chat works: the bar says so.
+    const quietFor = !finished && p.updatedAt !== undefined ? now - p.updatedAt : 0
+    const quiet = working && quietFor >= STALE_SHOW_MS ? ` · ⚠ no update ${dur(quietFor)}` : ''
     // Subagents of this plan: a quiet count on the bar while any work, a short list in the details.
     const helpers = (await read($, agentsAtom)).filter(ag => p.startedAt === null || ag.startedAt >= p.startedAt)
     const busyHelpers = helpers.filter(ag => ag.status === 'working').length
     const agentsText = busyHelpers ? ` · ${busyHelpers} agent${busyHelpers === 1 ? '' : 's'}` : ''
     const tail = ` · ${etaText(est)}${total ? ` · ${tok(total)} tok` : ''}${agentsText} ${isOpen ? '▾' : '▴'}`
-    const fixed = 2 + 1 + 1 + count.length + tail.length
-    const nameW = Math.max(8, Math.min(36, Math.floor((cols - fixed) * 0.4)))
+    const fixed = 2 + 1 + 1 + count.length + subCount.length + quiet.length + tail.length
+    const nameW = Math.max(8, Math.min(40, Math.floor((cols - fixed) * 0.45)))
+    // The step and, inside it, the substep at hand.
+    const label = cur
+      ? curSub
+        ? `${cut(cur.text, Math.max(6, Math.min(Math.floor(nameW * 0.5), nameW - 3 - curSub.text.length)))} › ${curSub.text}`
+        : cur.text
+      : finished
+        ? 'All steps done'
+        : nextUp
+          ? `Next: ${nextUp.text}`
+          : p.title
     const barW = Math.max(6, cols - fixed - nameW)
-    const runs = barRuns(barW, n, est.done, !!cur, frame)
+    const runs = barRuns(barW, n, est.done, est.progress, !!cur, frame)
 
     const row = (
       <Button key="plan-bar-toggle" plain onPress={() => update($, openAtom, v => !v)}>
@@ -661,6 +908,8 @@ export const register: Register = on => {
         <Text bold color={P_MID}>
           {count}
         </Text>
+        {subCount ? <Text color={P_MID}>{subCount}</Text> : null}
+        {quiet ? <Text color={P_WARN}>{quiet}</Text> : null}
         <Text dimColor>{tail}</Text>
       </Button>
     )
@@ -670,17 +919,33 @@ export const register: Register = on => {
     const textW = Math.max(4, inner - 2 - TOK_W - TIME_W)
     const helperLines = helpers.length ? 1 + Math.min(HELPER_ROWS, helpers.length) + (helpers.length > HELPER_ROWS ? 1 : 0) : 0
     const room = Math.max(3, Math.min(14, (e.props.maxRows || 16) - 7 - helperLines))
-    const focus = curIdx >= 0 ? curIdx : Math.max(0, p.steps.findIndex(s => s.status === 'pending'))
-    const from = n <= room ? 0 : Math.max(0, Math.min(n - room, focus - Math.floor(room / 2)))
-    const shown = p.steps.slice(from, from + room)
+    type Line = { i: number; j: number | null }
+    const lines: Line[] = []
+    for (let i = 0; i < n; i++) {
+      lines.push({ i, j: null })
+      const st = p.steps[i]!
+      if (st.status === 'in_progress') for (let j = 0; j < (st.substeps?.length ?? 0); j++) lines.push({ i, j })
+    }
+    const focusStep = curIdx >= 0 ? curIdx : Math.max(0, p.steps.findIndex(s => s.status === 'pending'))
+    const subFocus = curSub && cur?.substeps ? cur.substeps.indexOf(curSub) : -1
+    const focus = Math.max(
+      0,
+      lines.findIndex(l => l.i === focusStep && (subFocus < 0 ? l.j === null : l.j === subFocus)),
+    )
+    const L = lines.length
+    const from = L <= room ? 0 : Math.max(0, Math.min(L - room, focus - Math.floor(room / 2)))
+    const shown = lines.slice(from, from + room)
+    const subTimes = cur ? subSpent(cur) : []
     const since = (s: BarStep) => Math.max(s.startedAt ?? 0, est.last ?? p.startedAt ?? 0)
     const elapsed = p.startedAt === null ? null : (finished && est.last !== null ? est.last : now) - p.startedAt
-    const head = `${est.done} of ${n} done${elapsed === null ? '' : ` · ${dur(elapsed)} ${finished ? 'in all' : 'so far'}`}`
+    const head = `${est.done} of ${n} done · ${Math.round(est.progress * 100)}%${elapsed === null ? '' : ` · ${dur(elapsed)} ${finished ? 'in all' : 'so far'}`}`
     const foot = finished
       ? 'Every step is done.'
-      : est.avg === null || est.eta === null
-        ? 'The estimate starts once a step is done.'
-        : `avg ${dur(est.avg)} per step × ${est.left} left ≈ ${dur(est.eta)}`
+      : est.eta === null
+        ? 'The estimate starts once a step or substep is done.'
+        : est.avg === null
+          ? `≈ ${dur(est.eta)} left, from the substeps' pace`
+          : `avg ${dur(est.avg)} per step × ${est.left} left ≈ ${dur(est.eta)}`
     const other = p.otherTokens ?? 0
     const tokLine = total
       ? `Tokens: ${tok(total)} total · ${tok(usage.cacheRead)} cache reads · ${tok(usage.input + usage.cacheWrite)} new input · ${tok(usage.output)} output` +
@@ -735,8 +1000,29 @@ export const register: Register = on => {
           <Text dimColor>{` · ${head}`}</Text>
         </Text>
         {from > 0 ? <Text dimColor>{`  ↑ ${from} earlier`}</Text> : null}
-        {shown.map((s, k) => {
-          const i = from + k
+        {shown.map(({ i, j }) => {
+          const s = p.steps[i]!
+          if (j !== null) {
+            const sb = s.substeps![j]!
+            const live = i === curIdx && sb === curSub && sb.status === 'in_progress'
+            const sMark = sb.status === 'completed' ? '✓' : live ? spin : '·'
+            const st = sb.status === 'completed' && i === curIdx ? subTimes[j] : null
+            return (
+              <Box flexDirection="row" width={inner}>
+                <Text color={sb.status === 'completed' ? P_MID : live ? P_DEEP : undefined} dimColor={sb.status === 'pending'}>
+                  {`    ${sMark} `}
+                </Text>
+                <Box width={Math.max(4, textW + TOK_W - 4)}>
+                  <Text bold={live} dimColor={sb.status !== 'in_progress'} wrap="truncate-end">
+                    {cut(sb.text, Math.max(4, textW + TOK_W - 4))}
+                  </Text>
+                </Box>
+                <Box width={TIME_W} justifyContent="flex-end">
+                  <Text dimColor>{st === null || st === undefined ? '' : dur(st)}</Text>
+                </Box>
+              </Box>
+            )
+          }
           const isCur = i === curIdx
           const mark = s.status === 'completed' ? '✓' : isCur ? spin : '○'
           const spent = est.spent[i]
@@ -755,7 +1041,7 @@ export const register: Register = on => {
               </Text>
               <Box width={textW}>
                 <Text bold={isCur} dimColor={s.status === 'pending'} wrap="truncate-end">
-                  {cut(s.text, textW)}
+                  {cut(s.substeps?.length ? `${s.text} (${doneCount(s.substeps)}/${s.substeps.length})` : s.text, textW)}
                 </Text>
               </Box>
               <Box width={TOK_W} justifyContent="flex-end">
@@ -771,7 +1057,7 @@ export const register: Register = on => {
             </Box>
           )
         })}
-        {from + room < n ? <Text dimColor>{`  ↓ ${n - from - room} more`}</Text> : null}
+        {from + room < L ? <Text dimColor>{`  ↓ ${L - from - room} more`}</Text> : null}
         {helperRows}
         <Text color={P_MID} wrap="truncate-end">
           {cut(tokLine, inner)}
