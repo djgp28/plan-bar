@@ -1,0 +1,6 @@
+{
+  "name": "plan-bar",
+  "version": "0.6.0",
+  "description": "Live plan progress, model, context and token usage in the Codex terminal footer.",
+  "hooks": "./hooks/hooks.json"
+}

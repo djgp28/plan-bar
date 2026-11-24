@@ -1,0 +1,12 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "^update_plan$",
+        "hooks": [
+          {"type": "command", "command": "python3 \"$PLUGIN_ROOT/statusline.py\" record"}
+        ]
+      }
+    ]
+  }
+}

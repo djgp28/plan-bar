@@ -704,12 +704,12 @@ export const register: Register = on => {
         if (block.type !== 'tool_use') continue
         if (block.name === 'TodoWrite') {
           planned('TodoWrite')
-          void applyPlan($, undefined, parseTodos(asObject(block.input))).catch(err => log($, `todos: ${String(err)}`))
+          await applyPlan($, undefined, parseTodos(asObject(block.input))).catch(err => log($, `todos: ${String(err)}`))
         } else if (block.name === HD_TOOL) {
           const parsed = parsePlan(asObject(block.input))
           if (typeof parsed === 'string') continue
           planned(HD_TOOL)
-          void applyPlan($, parsed.title, parsed.steps).catch(err => log($, `helper-desk plan: ${String(err)}`))
+          await applyPlan($, parsed.title, parsed.steps).catch(err => log($, `helper-desk plan: ${String(err)}`))
         }
       }
     }

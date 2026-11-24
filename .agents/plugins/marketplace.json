@@ -1,0 +1,12 @@
+{
+  "name": "plan-bar-codex",
+  "interface": {"displayName": "Plan Bar for Codex"},
+  "plugins": [
+    {
+      "name": "plan-bar",
+      "source": {"source": "local", "path": "./codex"},
+      "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
+      "category": "Productivity"
+    }
+  ]
+}
